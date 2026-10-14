@@ -27,11 +27,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: checkout alphaseek (vp 模块)
+      - name: checkout alphaseek (vp 模块, 私有仓库 → PAT)
         uses: actions/checkout@v4
         with:
           repository: treper/alphaseek
           path: alphaseek
+          token: ${{ secrets.ALPHASEEK_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
