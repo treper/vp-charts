@@ -69,7 +69,7 @@
       <div class="card"><h3>交易日 Session Profiles</h3><div id="sessTable" style="max-height:260px;overflow-y:auto"></div></div>
     </div>
   </div>
-  <div id="footer"><span>generated 2026-10-14 21:20 · vp studio</span><span id="liveStatus"></span><span>vp studio · lightweight-charts</span></div>
+  <div id="footer"><span>generated 2026-10-14 21:46 · vp studio</span><span id="liveStatus"></span><span>vp studio · lightweight-charts</span></div>
 </div>
 <script>/*!
  * @license
@@ -602,6 +602,9 @@
  *
  * 合并策略: 1m 覆盖的交易日(m≥10 根且首根在 09:30/09:31)整日用 1m 替换
  * 快照 K,避免 5m/1m 混算重复计量;更早的日子保留快照.
+ * 量纲自校准: 腾讯量纲随板块漂移(主板/ETF=手, 688科创板=股, quote f6 恒等于
+ * m1 日合计), 快照单位随生成源(东财=手, Longport=股) → 合并前用重叠 5 分钟窗
+ * 自测倍数并归一, 否则当日量偏差 10^k 倍,profile 整体跳变.
  * 算法移植: profile.py 的三角形分摊/VA/HVN·LVN/session/CYQ 在 JS 端等价实现,
  * 保证"刷新重算"与"服务端生成"口径一致(页面加载后做一次等价性自检).
  */
@@ -726,6 +729,44 @@
     return raw.map(function (b) {
       var t = Date.parse(b.t.replace(' ', 'T') + 'Z') / 1000;   // 墙钟伪装 UTC,同 app.js
       return { time: t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v, buy: b.b, sell: Math.max(0, b.v - b.b), i: 0 };
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // 量纲自校准 — 快照(东财=手/Longport=股) 与 腾讯 m1(主板/ETF=手, 688科创板=股)
+  // 单位可能差 10^k 倍。取两边最新共享日的最后一根快照 bar 的 5 分钟窗 (T-5,T]
+  // 同窗求量之比,snap 到 10^k 作为校正因子(桶标签=结束时刻,5m/1m 快照都精确对齐;
+  // ±竞价分桶/粒度噪声 < ×1.25,被 snap 吸收)。quote 与 m1 同源同量纲,共用一因子。
+  // ------------------------------------------------------------------
+  function unitFactor(snapBars, m1) {
+    if (!snapBars || !snapBars.length || !m1 || !m1.length) return 1;
+    var days = {}, i;
+    for (i = 0; i < m1.length; i++) days[m1[i].t.slice(0, 10)] = 1;
+    var last = null;                                         // 快照在共享日里的最后一根
+    for (i = snapBars.length - 1; i >= 0; i--) {
+      if (days[snapBars[i].t.slice(0, 10)]) { last = snapBars[i]; break; }
+    }
+    if (!last) return 1;                                     // 无共享日(快照过旧) → 不动
+    var day = last.t.slice(0, 10);
+    var hm = last.t.slice(11, 16).split(':');
+    var tEnd = (+hm[0]) * 60 + (+hm[1]), tStart = tEnd - 5;
+    function mins(t) { var p = t.slice(11, 16).split(':'); return (+p[0]) * 60 + (+p[1]); }
+    var m1Sum = 0, snapSum = 0;
+    for (i = 0; i < m1.length; i++) {
+      if (m1[i].t.slice(0, 10) === day) { var a = mins(m1[i].t); if (a > tStart && a <= tEnd) m1Sum += m1[i].v; }
+    }
+    for (i = 0; i < snapBars.length; i++) {
+      if (snapBars[i].t.slice(0, 10) === day) { var c = mins(snapBars[i].t); if (c > tStart && c <= tEnd) snapSum += snapBars[i].v; }
+    }
+    if (!(m1Sum > 0) || !(snapSum > 0)) return 1;
+    var k = Math.round(Math.log(m1Sum / snapSum) / Math.LN10);
+    if (!isFinite(k) || k === 0 || k < -3 || k > 3) return 1;
+    return Math.pow(10, k);
+  }
+
+  function rescaleBars(barsArr, f) {           // 只缩放量的字段(v/b), 价格不动
+    return barsArr.map(function (b) {
+      return { t: b.t, o: b.o, h: b.h, l: b.l, c: b.c, v: b.v / f, b: b.b / f };
     });
   }
 
@@ -1000,11 +1041,12 @@
         setStatus('✕ 行情获取失败(重试中)', true);
         schedule(); return;
       }
-      var dailyArr = D.dailyArr ? applyQuoteToDaily(D.dailyArr, q) : null;
       fetchMkline('m1', function (m1) {
         try {
           var changed = false;
           if (m1 && m1.length) {
+            var uf = unitFactor(RAW, m1);
+            if (uf !== 1) { m1 = rescaleBars(m1, uf); q.vol = q.vol / uf; }
             var merged = mergeBars(RAW, m1);
             if (merged.bars.length !== RAW.length ||
                 merged.bars[merged.bars.length - 1].t !== RAW[RAW.length - 1].t) {
@@ -1017,8 +1059,8 @@
               changed = true;
             }
           }
-          if (dailyArr) {
-            var cyq2 = cyqFromDaily(dailyArr);
+          if (D.dailyArr) {
+            var cyq2 = cyqFromDaily(applyQuoteToDaily(D.dailyArr, q));
             if (cyq2) { API.replaceCyq(cyq2); changed = true; }
           }
           API.renderAll();
@@ -1064,6 +1106,7 @@
   // 调试/测试钩子 (bars 为 raw 格式)
   window.__vpLive = {
     refresh: refresh, mergeBars: mergeBars, toChartBars: toChartBars,
+    unitFactor: unitFactor, rescaleBars: rescaleBars,
     raw: function () { return RAW; },
     compositeFromBars: compositeFromBars, sessionsFromMerged: sessionsFromMerged,
     cyqFromDaily: cyqFromDaily,
