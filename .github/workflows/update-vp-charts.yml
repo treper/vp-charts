@@ -1,0 +1,72 @@
+name: update-vp-charts
+
+# 盘后自动重新生成快照页(补历史窗口);盘中 30s 实时由页面内 live.js 承担,
+# 所以每天一次即可。cron 为 UTC:07:10 = 北京 15:10(收盘后)。
+on:
+  schedule:
+    - cron: '10 7 * * 1-5'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-vp-charts
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # 加新标的:列表里追加,再在 index.html 加一行链接
+      SYMBOLS: '513050.SH 513180.SH 513310.SH 513330.SH 518880.SH 688825.SH 159326.SZ 159915.SZ 160644.SZ'
+      LONGPORT_APP_KEY: ${{ secrets.LONGPORT_APP_KEY }}
+      LONGPORT_APP_SECRET: ${{ secrets.LONGPORT_APP_SECRET }}
+      LONGPORT_ACCESS_TOKEN: ${{ secrets.LONGPORT_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: checkout alphaseek (vp 模块)
+        uses: actions/checkout@v4
+        with:
+          repository: treper/alphaseek
+          path: alphaseek
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-vp.txt
+
+      - name: 安装依赖
+        run: pip install -r requirements-vp.txt
+
+      - name: 生成快照页
+        run: |
+          cd alphaseek
+          for SYM in $SYMBOLS; do
+            echo "[vp] $SYM"
+            python -m vp --symbol "$SYM" --days 20 --out "../vp_${SYM//./_}.html" \
+              || echo "::warning::$SYM 生成失败(其余继续)"
+          done
+
+      - name: commit & push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add vp_*.html
+          if git diff --cached --quiet; then
+            echo "快照无变化,跳过提交"
+            exit 0
+          fi
+          git commit -m "vp snapshot $(date -u +%FT%TZ)"
+          git push
+
+      - name: 飞书推送
+        env:
+          LARK_WEBHOOK: ${{ secrets.LARK_WEBHOOK }}
+        if: env.LARK_WEBHOOK != ''
+        run: |
+          curl -sS -X POST "$LARK_WEBHOOK" -H 'Content-Type: application/json' \
+            -d '{"msg_type":"text","content":{"text":"📊 vp-charts 快照已更新(Actions 盘后生成,盘中页面自更新30s)\nhttps://treper.github.io/vp-charts/"}}'
