@@ -46,10 +46,16 @@ jobs:
       - name: 生成快照页
         run: |
           cd alphaseek
+          FAILED=""
           for SYM in $SYMBOLS; do
             echo "[vp] $SYM"
             python -m vp --symbol "$SYM" --days 20 --out "../vp_${SYM//./_}.html" \
-              || echo "::warning::$SYM 生成失败(其余继续)"
+              || FAILED="$FAILED $SYM"
+          done
+          for SYM in $FAILED; do               # 二次补跑: 东财偶发 ~10s 级断连阵发, 隔几分钟再试
+            echo "[vp] retry $SYM"
+            python -m vp --symbol "$SYM" --days 20 --out "../vp_${SYM//./_}.html" \
+              || echo "::warning::$SYM 生成失败(已重试)"
           done
 
       - name: commit & push
